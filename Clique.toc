@@ -7,6 +7,7 @@
 
 Localization.lua
 Clique.lua
-CliqueOptions.lua
 CliqueUtils.lua
+CliqueSpellbook.lua
+CliqueOptions.lua
 Clique.xml
