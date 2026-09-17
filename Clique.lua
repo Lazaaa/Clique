@@ -1,314 +1,381 @@
---[[---------------------------------------------------------------------------------
-  Clique by Cladhaire <cladhaire@gmail.com>
-  GUI concept/code by Gello 
-  
-  TODO:
-  
-----------------------------------------------------------------------------------]]
+-- Clique 1.12.1 (Emberveil) rewrite
+-- Click-casting interface for vanilla WoW
+-- Based on the original Clique by Cladhaire
 
---[[---------------------------------------------------------------------------------
-  Create the AddOn object and create a local binding for AceLocale
-----------------------------------------------------------------------------------]]
+Clique = Clique or {}
+local CC = Clique
+local L = CC.L or {}
 
-Clique = AceLibrary("AceAddon-2.0"):new(
-    "AceHook-2.0", 
-    "AceConsole-2.0", 
-    "AceDB-2.0", 
-    "AceEvent-2.0",
-    "AceModuleCore-2.0",
-    "AceDebug-2.0"
-)
+-- =====================================================
+--  SAVED VARIABLES
+-- =====================================================
 
-Clique:RegisterDB("CliqueDB")
-local L = AceLibrary:GetInstance("AceLocale-2.0"):new("Clique")
+CliqueDB = CliqueDB or {}
+CliqueDB.bindings = CliqueDB.bindings or {}
+CliqueDB.settings = CliqueDB.settings or {
+    downclick = false,
+    fastooc = false,
+}
 
--- Expoxe AceHook and AceEvent to our modules
-Clique:SetModuleMixins("AceHook-2.0", "AceEvent-2.0", "AceDebug-2.0")
+-- =====================================================
+--  BIT OPERATIONS (Lua 5.1 - no bit library)
+-- =====================================================
 
---[[---------------------------------------------------------------------------------
-  This is the actual addon object
-----------------------------------------------------------------------------------]]
+local function band(a, b)
+    local result = 0
+    local bitval = 1
+    while a > 0 and b > 0 do
+        if a % 2 == 1 and b % 2 == 1 then
+            result = result + bitval
+        end
+        bitval = bitval * 2
+        a = math.floor(a / 2)
+        b = math.floor(b / 2)
+    end
+    return result
+end
 
-function Clique:OnInitialize()
-    self:LevelDebug(2, "Clique:OnInitialize()")
-    self:CheckProfile()
-    
-    self:LevelDebug(3, "Setting all modules to inactive.")
-    for name,module in self:IterateModules() do
-        self:ToggleModuleActive(name, false)
+local function bor(a, b)
+    local result = 0
+    local bitval = 1
+    while a > 0 or b > 0 do
+        if a % 2 == 1 or b % 2 == 1 then
+            result = result + bitval
+        end
+        bitval = bitval * 2
+        a = math.floor(a / 2)
+        b = math.floor(b / 2)
+    end
+    return result
+end
+
+CC.band = band
+CC.bor = bor
+
+-- =====================================================
+--  UNIT FRAME REGISTRATION
+-- =====================================================
+
+-- List of frames to register for click-casting
+local UNIT_FRAMES = {
+    { name = "PlayerFrame", unit = "player" },
+    { name = "TargetFrame", unit = "target" },
+    { name = "PetFrame", unit = "pet" },
+    { name = "FocusFrame", unit = "focus" },
+    { name = "TargetFrameToT", unit = "targettarget" },
+    { name = "FocusFrameToT", unit = "focustarget" },
+    { name = "PartyMemberFrame1", unit = "party1" },
+    { name = "PartyMemberFrame2", unit = "party2" },
+    { name = "PartyMemberFrame3", unit = "party3" },
+    { name = "PartyMemberFrame4", unit = "party4" },
+    { name = "PartyMemberFrame1PetFrame", unit = "partypet1" },
+    { name = "PartyMemberFrame2PetFrame", unit = "partypet2" },
+    { name = "PartyMemberFrame3PetFrame", unit = "partypet3" },
+    { name = "PartyMemberFrame4PetFrame", unit = "partypet4" },
+}
+
+-- Raid frames (raid1-40)
+for i = 1, 40 do
+    table.insert(UNIT_FRAMES, { name = "RaidGroup" .. i .. "Button", unit = "raid" .. i })
+end
+
+-- =====================================================
+--  FRAME REGISTRATION
+-- =====================================================
+
+function CC:RegisterFrame(frameName, unit)
+    local frame = _G[frameName]
+    if not frame then return end
+
+    -- Store the original OnClick
+    if not frame.cliqueOriginalOnClick then
+        frame.cliqueOriginalOnClick = frame:GetScript("OnClick")
+    end
+
+    -- Store the unit on the frame
+    frame.cliqueUnit = unit
+
+    -- Register for clicks
+    frame:RegisterForClicks("LeftButtonUp", "RightButtonUp", "MiddleButtonUp")
+
+    -- Set up the click handler
+    frame:SetScript("OnClick", function()
+        CC:OnClick(this, arg1)
+    end)
+
+    CC.frames[frame] = true
+    CC.unitFrames[unit] = frame
+end
+
+function CC:RegisterAllFrames()
+    for _, entry in ipairs(UNIT_FRAMES) do
+        self:RegisterFrame(entry.name, entry.unit)
     end
 end
 
-function Clique:OnEnable()
-    self:LevelDebug(2, "Clique:OnEnable()")
-    IndentationLib.addSmartCode(CliqueEditBox)
+-- =====================================================
+--  BINDING MANAGEMENT
+-- =====================================================
 
-    if GetCVar("AutoSelfCast") == "1" then
-        StaticPopup_Show("CLIQUE_AUTO_SELF_CAST")
-        return
-    end
-    
-    -- Register for ADDON_LOADED so we can load plugins for LOD addons
-    self:RegisterEvent("ADDON_LOADED", "LoadModules")
-    
-    -- Build the action table, so we have precompiled functions
-	self:ScanSpellbook()
-    self:BuildActionTable()
-
-	-- Enable tooltips in the GUI
-	self:EnableTooltips()
-    self:RegUtilFuncs()
-    
-    -- Create the hook tables
-    self._OnClick = {}
-    
-    -- Load any valid modules
-    self:LoadModules()
-
-    -- Hook the SpellBookFrame so we can hide/show as needed
-    self:HookScript(SpellBookFrame, "OnShow", "SpellBookFrame_OnShow")
-    for i=1,12 do
-        local button = getglobal("SpellButton"..i)
-        button:RegisterForClicks("LeftButtonUp","RightButtonUp", "MiddleButtonUp", "Button4Up", "Button5Up");
-        self:HookScript(button, "OnClick", "SpellButton_OnClick")
-    end
+-- Get the binding key from button and modifiers
+function CC:GetBindingKey(button, modifiers)
+    return string.format("%s%d", button or "LeftButton", modifiers or 0)
 end
 
-function Clique:LoadModules()
-    for name,module in self:IterateModules() do
-        if not self:IsModuleActive(name) and not module.disabled then
-            -- Try to enable the module
-            
-            local loadModule = nil
-                        
-            if module.Test and type(module.Test) == "function" then
-                if module:Test() then
-                    loadModule = true
-                end
-            else
-                loadModule = true
-            end
-            
-            if loadModule and not Clique:IsModuleActive(name) then
-                self:LevelDebug(1, "Enabling module \"%s\" for %s.", name, module.fullname)
-                Clique:ToggleModuleActive(name,true)
- 
-                if module._OnClick then
-                    self:LevelDebug(2, "Grabbing _OnClick from %s", name)
-                    self._OnClick[name] = module
-                end
-            end
+-- Get the current modifier keys as a number
+function CC:GetModifiers()
+    local alt = IsAltKeyDown() and 1 or 0
+    local ctrl = IsControlKeyDown() and 2 or 0
+    local shift = IsShiftKeyDown() and 4 or 0
+    return alt + ctrl + shift
+end
+
+-- Get the appropriate click set for a unit
+function CC:GetClickSet(unit)
+    local set = "default"
+    
+    -- Check hostile first
+    if UnitCanAttack("player", unit) then
+        if self.bindings["hostile"] and next(self.bindings["hostile"]) then
+            set = "hostile"
+        end
+    else
+        if self.bindings["friendly"] and next(self.bindings["friendly"]) then
+            set = "friendly"
         end
     end
-end
-
-function Clique:CheckProfile()
-    self:LevelDebug(2, "Clique:CheckProfile()")
-
-    local profile = self.db.char
-    profile[L"DEFAULT_FRIENDLY"] = profile[L"DEFAULT_FRIENDLY"] or {}
-    profile[L"DEFAULT_HOSTILE"] = profile[L"DEFAULT_HOSTILE"] or {}
-end
-
-function Clique:BuildActionTable()
-    self:LevelDebug(2, "Clique:BuildActionTable()")
     
-    local actions = self:ClearTable(self.Actions)
-    self.Actions = actions
-    
-    for k,v in pairs(self.db.char) do
-        actions[k] = {}
-        
-        for i,entry in ipairs(v) do
-            local a = bit.band(entry.modifiers, 1)
-            local c = bit.band(entry.modifiers, 2)
-            local s = bit.band(entry.modifiers, 4)
-            
-            -- Skip any non-bound entries
-            if entry.button ~= L"BINDING_NOT_DEFINED" then 
-                local key = string.format("%s%d", entry.button, entry.modifiers)
-                local action = entry.action
-                if not action and not entry.custom then
-                    local buff = self.spellbook[entry.name]
-                    if buff then buff = tonumber(buff) end
-                    if self:IsBuff(entry.name) and not entry.rank then
-                        action = string.format("Clique:BestRank(\"%s\", Clique.unit)", entry.name)
-                    elseif entry.rank then
-                        action = string.format("Clique:CastSpell(\"%s(%s %d)\")", entry.name, L"RANK", entry.rank)
-                    else
-                        action = string.format("Clique:CastSpell(\"%s\")", entry.name)
-                    end
-                end
-                
-                --self:Print(action)
-                
-                local func,errString = loadstring(action)
-                if func then 
-                    actions[k][key] = func
-                else
-                    DEFAULT_CHAT_FRAME:AddMessage(string.format(L"ERROR_SCRIPT", errString))
-                end
-            end
-        end
+    -- Check OOC
+    if self.bindings["ooc"] and next(self.bindings["ooc"]) and not UnitAffectingCombat("player") then
+        set = "ooc"
     end
+    
+    return set
 end
 
-function Clique:OnClick(button, unit)
-    unit = unit or this.unit 
-    button = button or arg1
-    local a,c,s = IsAltKeyDown() or 0, IsControlKeyDown() or 0, IsShiftKeyDown() or 0 
-
-    local targettarget = nil
-
-    if not unit then
-        unit = this:GetParent().unit
-        if not unit then
-            error(string.format(L"NO_UNIT_FRAME", tostring(this:GetName())))
-        end
+-- Get the binding for a click
+function CC:GetBinding(unit, button, modifiers)
+    local set = self:GetClickSet(unit)
+    local key = self:GetBindingKey(button, modifiers)
+    
+    -- Try the specific set
+    if self.bindings[set] and self.bindings[set][key] then
+        return self.bindings[set][key]
     end
-	
-	if not UnitExists(unit) then
-		return
-	end
-
-    Clique.unit = unit
-	-- DEFAULT_CHAT_FRAME:AddMessage("Clique:OnClick("..tostring(button)..", "..tostring(unit)..")")
-    if not UnitExists(unit) then return end
-
-    -- If the casting hand is up on the screen, cast the waiting spell on
-    -- this unit
-    if SpellIsTargeting() then
-        if button == "LeftButton" then SpellTargetUnit(unit)
-        elseif button == "RightButton" then SpellStopTargeting() end
-        return true
+    
+    -- Fall back to default
+    if self.bindings["default"] and self.bindings["default"][key] then
+        return self.bindings["default"][key]
     end
+    
+    return nil
+end
 
-    -- If the cursor has an item and we're clicking on another player,
-    -- attempt to trade with them (or feed your pet, etc).  If we
-    -- LeftButton drop it on ourselves, then equip the item.  If we click
-    -- anything else, then put the item back in the backpack
+-- =====================================================
+--  CLICK HANDLER
+-- =====================================================
+
+function CC:OnClick(frame, button)
+    if not button then return end
+
+    local unit = frame.cliqueUnit
+    if not unit or not UnitExists(unit) then return end
+
+    -- If we have a cursor item, handle that first
     if CursorHasItem() then
         if button == "LeftButton" then
-            if unit == "player" then AutoEquipCursorItem()
-            else DropItemOnUnit(unit) end
-        else PutItemInBackpack() end
+            if unit == "player" then
+                AutoEquipCursorItem()
+            else
+                DropItemOnUnit(unit)
+            end
+        else
+            PutItemInBackpack()
+        end
         return
     end
 
-    -- We need to determine which cast set we're coming from
-	local default = L"DEFAULT_FRIENDLY"
-    local restore = nil
-
-	if UnitCanAttack("player", unit) then
-		default = L"DEFAULT_HOSTILE"
-	end
-    
-    Clique.set = default
-    
-    -- Iterate the hooks here
-    for name,module in pairs(Clique._OnClick) do
-        if module:_OnClick(button, Clique.unit) then 
-            self:LevelDebug(3, "Module %s has changed the clique set.", name)
-            break 
+    -- If we're targeting a spell, handle that
+    if SpellIsTargeting() then
+        if button == "LeftButton" then
+            SpellTargetUnit(unit)
+        elseif button == "RightButton" then
+            SpellStopTargeting()
         end
+        return
     end
-	
-	if not Clique.set or not Clique.Actions[Clique.set] then
-		Clique.set = default
-	end
 
-    local modifiers = 0
-    modifiers = bit.bor(modifiers, a * 1)
-    modifiers = bit.bor(modifiers, c * 2)
-    modifiers = bit.bor(modifiers, s * 4)
-	
-    local key = string.format("%s%d", button, modifiers)
-    local func = Clique.Actions[Clique.set][key]
-    local entry = Clique.db.char[Clique.set][key]
-	
-    self:LevelDebug(2, "Clique:OnClick("..button..", " .. modifiers..")")
-    
-	if not func then
-        self:LevelDebug(3, "Casting from the default set instead.")
-		func = Clique.Actions[default][key]
-		entry = Clique.db.char[default][key]
-	end
+    -- Get the binding
+    local modifiers = self:GetModifiers()
+    local binding = self:GetBinding(unit, button, modifiers)
 
-    if func then
-        func()
-		
-		-- In case spell failed to apply
-		if SpellIsTargeting() then SpellStopTargeting() end
+    if binding then
+        self:ExecuteBinding(binding, unit)
+        return
+    end
 
-        return true
+    -- Fall back to the original OnClick
+    if frame.cliqueOriginalOnClick then
+        frame.cliqueOriginalOnClick()
     else
-        --error("Could not find an action for key " .. key)
+        -- Default behavior: target the unit on left click
+        if button == "LeftButton" then
+            TargetUnit(unit)
+        end
     end
 end
 
-function Clique:CastSpell(spell, unit)
-	local restore = nil
-	unit = unit or Clique.unit
-    
-    -- IMPORTANT: If the unit is targettarget or more, then we need to try
-    -- to convert it to a friendly unit (to make click-casting work
-    -- properly). If this isn't successful, set it up so we restore our 
-    -- target
-	
-	self:LevelDebug(2, "Clique:CastSpell("..tostring(spell)..", "..tostring(unit) .. ")")
+-- =====================================================
+--  BINDING EXECUTION
+-- =====================================================
 
-    if string.find(unit, "target") and string.len(unit) > 6 then
-        local friendly = Clique:GetFriendlyUnit(unit)
+function CC:ExecuteBinding(binding, unit)
+    if not binding then return end
 
-        if friendly then
-            unit = friendly
-        else
-			self:LevelDebug(2, "Setting targettarget flag.")
-            targettarget = true
-        end
+    local btype = binding.type
+
+    if btype == "spell" then
+        self:CastSpell(binding.spell, unit)
+    elseif btype == "macro" then
+        self:RunMacro(binding.macrotext, unit)
+    elseif btype == "target" then
+        TargetUnit(unit)
+    elseif btype == "menu" then
+        self:ShowUnitMenu(unit)
     end
-    
-    -- Lets resolve the targeting.  If this is a hostile target and its
-    -- not currently our target, then we will need to target the unit
-    if UnitCanAttack("player", unit) then
-        if not UnitIsUnit(unit, "target") then
-            self:LevelDebug(2, "Changing to hostile target.")
-            TargetUnit(unit)
-        end
+end
 
-	-- If we're looking at someone else's target, we have to change targets since
-    -- ClearTarget() will get rid of the blahtarget unitID entirely.  We only do
-	-- this if this is a friendly target (since they will consume the spell)
-	elseif targettarget and not UnitCanAttack("player", "target") then
-		self:LevelDebug(2, "Changing target due to friendly target.")
-		TargetUnit(unit)
-    
-    -- If the target is a friendly unit, and its not the unit we're casting on
-    elseif UnitExists("target") and not UnitCanAttack("player", "target") and not UnitIsUnit(unit, "target") then
-        self:LevelDebug(3, "Clearing the target")
+function CC:CastSpell(spell, unit)
+    if not spell or not unit then return end
+    if not UnitExists(unit) then return end
+
+    -- Store the current target
+    local hadTarget = UnitExists("target")
+
+    -- If we're targeting a friendly unit and need to cast on a different friendly unit,
+    -- clear the target first
+    if UnitExists("target") and not UnitCanAttack("player", "target") and not UnitIsUnit(unit, "target") then
         ClearTarget()
-        restore = true
-	
-    elseif UnitExists("target") and self:IsDualSpell(spell) and not UnitIsUnit(unit, "target") then
-        self:LevelDebug(3, "Clearing target for this dual spell")
-        ClearTarget()
-        restore = true
     end
 
-    --self:Print("Clique:CastSpell(%s, %s)", spell, unit)
-    --self:Print("Dual Spell: %s, %s", spell, tostring(self:IsDualSpell(spell)))
-    
-	CastSpellByName(spell)
-	
-	if SpellIsTargeting() then
-        self:LevelDebug(3, "SpellTargetingUnit")
+    -- Cast the spell
+    CastSpellByName(spell)
+
+    -- If the spell needs a target, target the unit
+    if SpellIsTargeting() then
         SpellTargetUnit(unit)
-	end
+    end
+
+    -- Restore the target if we cleared it
+    if hadTarget then
+        TargetLastTarget()
+    end
+end
+
+function CC:RunMacro(macrotext, unit)
+    if not macrotext then return end
+    RunMacroText(macrotext)
+end
+
+function CC:ShowUnitMenu(unit)
+    if not unit then return end
     
-    if SpellIsTargeting() then SpellStopTargeting() end
-	
-	if restore then
-        self:LevelDebug(3, "Restoring with TargetLastTarget")
-		TargetLastTarget()
-	end
+    -- Determine the frame for this unit
+    local frameName
+    if unit == "player" then
+        frameName = "PlayerFrame"
+    elseif unit == "target" then
+        frameName = "TargetFrame"
+    elseif unit == "pet" then
+        frameName = "PetFrame"
+    elseif string.find(unit, "party") then
+        local num = string.match(unit, "(%d+)$")
+        frameName = "PartyMemberFrame" .. num
+    elseif string.find(unit, "raid") then
+        local num = string.match(unit, "(%d+)$")
+        frameName = "RaidGroup" .. num .. "Button"
+    end
+    
+    local frame = _G[frameName]
+    if not frame then return end
+    
+    -- Get the dropdown
+    local dropdownName = frameName .. "DropDown"
+    local dropdown = _G[dropdownName]
+    if dropdown then
+        ToggleDropDownMenu(1, nil, dropdown, "cursor")
+    end
+end
+
+-- =====================================================
+--  BINDING MANAGEMENT FUNCTIONS
+-- =====================================================
+
+function CC:AddBinding(clickSet, button, modifiers, binding)
+    if not self.bindings[clickSet] then
+        self.bindings[clickSet] = {}
+    end
+    
+    local key = self:GetBindingKey(button, modifiers)
+    self.bindings[clickSet][key] = binding
+    self:SaveBindings()
+end
+
+function CC:DeleteBinding(clickSet, button, modifiers)
+    if not self.bindings[clickSet] then return end
+    
+    local key = self:GetBindingKey(button, modifiers)
+    self.bindings[clickSet][key] = nil
+    self:SaveBindings()
+end
+
+function CC:SaveBindings()
+    CliqueDB.bindings = self.bindings
+end
+
+function CC:LoadBindings()
+    self.bindings = CliqueDB.bindings or {}
+end
+
+-- =====================================================
+--  INITIALIZATION
+-- =====================================================
+
+function CC:Initialize()
+    self:LoadBindings()
+    self:RegisterAllFrames()
+end
+
+-- Event handling
+local eventFrame = CreateFrame("Frame")
+eventFrame:RegisterEvent("PLAYER_ENTERING_WORLD")
+eventFrame:RegisterEvent("PLAYER_REGEN_ENABLED")
+eventFrame:RegisterEvent("PLAYER_REGEN_DISABLED")
+
+eventFrame:SetScript("OnEvent", function()
+    if event == "PLAYER_ENTERING_WORLD" then
+        CC:Initialize()
+        DEFAULT_CHAT_FRAME:AddMessage("|cff00ff00" .. (L["ADDON_NAME"] or "Clique") .. "|r " .. (L["LOADED"] or "loaded. Use /clique for options."))
+    elseif event == "PLAYER_REGEN_ENABLED" then
+        CC:RegisterAllFrames()
+    end
+end)
+
+-- Slash command
+SLASH_CLIQUE1 = "/clique"
+SlashCmdList["CLIQUE"] = function(msg)
+    if msg == "debug" then
+        for set, bindings in pairs(CC.bindings) do
+            DEFAULT_CHAT_FRAME:AddMessage("Set: " .. set)
+            for key, binding in pairs(bindings) do
+                DEFAULT_CHAT_FRAME:AddMessage("  " .. key .. " -> " .. (binding.spell or binding.macrotext or binding.type))
+            end
+        end
+    else
+        if CC.ToggleOptions then
+            CC:ToggleOptions()
+        else
+            DEFAULT_CHAT_FRAME:AddMessage("|cff00ff00Clique|r loaded. Use /clique debug for debugging.")
+        end
+    end
 end
