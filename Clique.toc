@@ -2,6 +2,7 @@
 ## Title: Clique Emberveil version
 ## Author: Kharon
 ## default author: Cladhaire (1.12.1 port)
+## Version: 1.0.1
 ## Notes: Simply powerful click-casting interface
 ## SavedVariables: CliqueDB
 
